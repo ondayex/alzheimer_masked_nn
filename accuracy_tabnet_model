@@ -1,0 +1,407 @@
+import tensorflow as tf
+from tensorflow.keras import layers, Model
+import numpy as np
+import pandas as pd
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+
+class TabNetFeatureTransformer(layers.Layer):
+    def __init__(
+        self, feature_dim, output_dim, trainable=True, name=None, dtype=None, **kwargs
+    ):
+        super().__init__(trainable=trainable, name=name, dtype=dtype, **kwargs)
+        self.feature_dim = feature_dim
+        self.output_dim = output_dim
+
+        self.dense1 = layers.Dense(
+            feature_dim,
+            use_bias=False,
+            kernel_regularizer=tf.keras.regularizers.l2(0.01),
+        )
+        self.bn1 = layers.BatchNormalization()
+        self.dropout1 = layers.Dropout(0.2)
+
+        self.dense2 = layers.Dense(
+            output_dim,
+            use_bias=False,
+            kernel_regularizer=tf.keras.regularizers.l2(0.01),
+        )
+        self.bn2 = layers.BatchNormalization()
+        self.dropout2 = layers.Dropout(0.2)
+
+    def call(self, x, training=None):
+        x = self.dense1(x)
+        x = self.bn1(x, training=training)
+        x = tf.nn.gelu(x)
+        x = self.dropout1(x, training=training)
+
+        x = self.dense2(x)
+        x = self.bn2(x, training=training)
+        x = tf.nn.gelu(x)
+        x = self.dropout2(x, training=training)
+        return x
+
+
+class TabNetAttentiveTransformer(layers.Layer):
+    def __init__(
+        self,
+        feature_dim,
+        spark_rate=0.3,
+        trainable=True,
+        name=None,
+        dtype=None,
+        **kwargs,
+    ):
+        super().__init__(trainable=trainable, name=name, dtype=dtype, **kwargs)
+        self.feature_dim = feature_dim
+        self.spark_rate = spark_rate
+
+        self.dense = layers.Dense(
+            feature_dim,
+            use_bias=False,
+            kernel_regularizer=tf.keras.regularizers.l2(0.01),
+        )
+        self.bn = layers.BatchNormalization()
+        self.dropout = layers.Dropout(0.2)
+
+    def call(self, x, prior_scales=None, training=None):
+        x = self.dense(x)
+        x = self.bn(x, training=training)
+        x = tf.nn.gelu(x)
+        x = self.dropout(x, training=training)
+
+        if training:
+            mask = tf.cast(
+                tf.random.uniform(tf.shape(x)) > self.spark_rate, dtype=x.dtype
+            )
+            x = x * mask
+
+        if prior_scales is not None:
+            x = x * prior_scales
+
+        return tf.nn.softmax(x, axis=-1)
+
+
+class MaskedTabNet(Model):
+    def __init__(
+        self,
+        feature_dim,
+        output_dim=1,
+        n_steps=4,
+        n_shared=2,
+        spark_rate=0.3,
+        trainable=True,
+        name=None,
+        dtype=None,
+        **kwargs,
+    ):
+        super().__init__(name=name, dtype=dtype, trainable=trainable, **kwargs)
+        self.feature_dim = feature_dim
+        self.n_steps = n_steps
+
+        # Initial feature processing
+        self.mask_transformer = TabNetFeatureTransformer(
+            feature_dim=feature_dim, output_dim=feature_dim
+        )
+
+        # Feature transformers
+        self.shared_transformers = []
+        for _ in range(n_shared):
+            self.shared_transformers.append(
+                TabNetFeatureTransformer(
+                    feature_dim=feature_dim * 2, output_dim=feature_dim * 2
+                )
+            )
+
+        # Attention transformers
+        self.attention_layers = []
+        for _ in range(n_steps):
+            self.attention_layers.append(
+                TabNetAttentiveTransformer(
+                    feature_dim=feature_dim * 2, spark_rate=spark_rate
+                )
+            )
+
+        # Final processing
+        self.final_transformer = TabNetFeatureTransformer(
+            feature_dim=feature_dim * n_steps, output_dim=feature_dim
+        )
+
+        self.output_layer = layers.Dense(output_dim, activation="sigmoid")
+
+    def call(self, inputs, training=None):
+        features, masks = inputs
+
+        # Convert masks to float
+        masks = tf.cast(masks, tf.float32)
+
+        # Process masks
+        mask_features = self.mask_transformer(masks, training=training)
+
+        # Combine features
+        x = tf.concat([features * masks, mask_features], axis=-1)
+
+        # Initialize attention scales
+        prior_scales = tf.ones((tf.shape(features)[0], self.feature_dim * 2))
+
+        step_outputs = []
+        total_entropy = 0.0
+
+        # Process through steps
+        for step_idx in range(self.n_steps):
+            # Apply shared transformers
+            step_features = x
+            for transformer in self.shared_transformers:
+                # Add residual connection
+                residual = step_features
+                step_features = transformer(step_features, training=training)
+                if step_features.shape == residual.shape:
+                    step_features = step_features + residual
+
+            # Apply attention
+            attention = self.attention_layers[step_idx](
+                step_features, prior_scales, training=training
+            )
+
+            # Update scales
+            prior_scales = prior_scales * (1 - attention + 1e-6)
+
+            # Transform features
+            masked_features = step_features * attention
+            step_outputs.append(masked_features)
+
+            # Calculate entropy
+            entropy = -tf.reduce_mean(
+                tf.reduce_sum(attention * tf.math.log(attention + 1e-15), axis=1)
+            )
+            total_entropy += entropy
+
+        # Combine outputs
+        combined = tf.concat(step_outputs, axis=1)
+        transformed = self.final_transformer(combined, training=training)
+        output = self.output_layer(transformed)
+
+        if training:
+            self.add_loss(0.01 * total_entropy)
+
+        return output
+
+
+class AlzheimersDataPreprocessor:
+    def __init__(self):
+        self.scalers = {}
+
+    def preprocess(self, data, is_training=True):
+        df = data.copy()
+        df = df.drop(["PatientID", "DoctorInCharge"], axis=1)
+
+        if "Diagnosis" in df.columns:
+            y = df["Diagnosis"].values
+            X = df.drop("Diagnosis", axis=1)
+        else:
+            X = df
+            y = None
+
+        numerical_columns = [
+            "Age",
+            "BMI",
+            "AlcoholConsumption",
+            "PhysicalActivity",
+            "DietQuality",
+            "SleepQuality",
+            "SystolicBP",
+            "DiastolicBP",
+            "CholesterolTotal",
+            "CholesterolLDL",
+            "CholesterolHDL",
+            "CholesterolTriglycerides",
+            "MMSE",
+            "FunctionalAssessment",
+            "ADL",
+        ]
+
+        for col in numerical_columns:
+            if is_training:
+                self.scalers[col] = StandardScaler()
+                X[col] = self.scalers[col].fit_transform(X[col].values.reshape(-1, 1))
+            else:
+                X[col] = self.scalers[col].transform(X[col].values.reshape(-1, 1))
+
+        mask = ~X.isna()
+        X = X.fillna(0)
+        X = X.values
+        mask = mask.values
+
+        if y is not None:
+            return X, mask, y
+        return X, mask
+
+
+def prepare_data(data, test_size=0.2, random_state=42):
+    preprocessor = AlzheimersDataPreprocessor()
+    train_data, test_data = train_test_split(
+        data, test_size=test_size, random_state=random_state, stratify=data["Diagnosis"]
+    )
+    X_train, masks_train, y_train = preprocessor.preprocess(
+        train_data, is_training=True
+    )
+    X_test, masks_test, y_test = preprocessor.preprocess(test_data, is_training=False)
+    return (X_train, X_test, masks_train, masks_test, y_train, y_test, preprocessor)
+
+
+def create_masked_tabnet(input_dim):
+    model = MaskedTabNet(
+        feature_dim=input_dim, output_dim=1, n_steps=4, n_shared=2, spark_rate=0.3
+    )
+
+    optimizer = tf.keras.optimizers.Adam(
+        learning_rate=0.001,
+        clipnorm=0.5,
+        weight_decay=0.01,
+        beta_1=0.9,
+        beta_2=0.999,
+        epsilon=1e-07,
+    )
+
+    model.compile(
+        optimizer=optimizer,
+        loss=tf.keras.losses.BinaryCrossentropy(label_smoothing=0.05),
+        metrics=[
+            "accuracy",
+            tf.keras.metrics.AUC(name="auc"),
+            tf.keras.metrics.Precision(name="precision"),
+            tf.keras.metrics.Recall(name="recall"),
+        ],
+    )
+
+    return model
+
+
+def train_masked_tabnet(
+    model,
+    X_train,
+    masks_train,
+    y_train,
+    X_val,
+    masks_val,
+    y_val,
+    epochs=100,
+    batch_size=64,  # Reduced batch size
+):
+    callbacks = [
+        tf.keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=15, restore_best_weights=True
+        ),
+        tf.keras.callbacks.ModelCheckpoint(
+            "masked_tabnet.weights.h5",
+            monitor="val_loss",
+            save_best_only=True,
+            save_weights_only=True,
+            verbose=1,
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss", factor=0.5, patience=5, min_lr=0.00001
+        ),
+    ]
+
+    n_samples = len(y_train)
+    n_classes = len(np.unique(y_train))
+    class_weights = {
+        i: n_samples / (n_classes * np.sum(y_train == i)) for i in range(n_classes)
+    }
+
+    history = model.fit(
+        [X_train, masks_train],
+        y_train,
+        validation_data=([X_val, masks_val], y_val),
+        epochs=epochs,
+        batch_size=batch_size,
+        class_weight=class_weights,
+        callbacks=callbacks,
+        verbose=1,
+    )
+
+    return history
+
+
+def plot_training_history(history):
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+
+    ax1.plot(history.history["accuracy"])
+    ax1.plot(history.history["val_accuracy"])
+    ax1.set_title("Model Accuracy")
+    ax1.set_ylabel("Accuracy")
+    ax1.set_xlabel("Epoch")
+    ax1.legend(["Train", "Validation"])
+
+    ax2.plot(history.history["loss"])
+    ax2.plot(history.history["val_loss"])
+    ax2.set_title("Model Loss")
+    ax2.set_ylabel("Loss")
+    ax2.set_xlabel("Epoch")
+    ax2.legend(["Train", "Validation"])
+
+    plt.tight_layout()
+    plt.show()
+
+
+if __name__ == "__main__":
+    filepath = "../alzheimer_masked_nn/alzheimers_disease_data.csv"
+    data = pd.read_csv(filepath)
+
+    X_train, X_test, masks_train, masks_test, y_train, y_test, preprocessor = (
+        prepare_data(data)
+    )
+
+    print("Data shapes:")
+    print(f"X_train: {X_train.shape}")
+    print(f"X_test: {X_test.shape}")
+    print(f"masks_train: {masks_train.shape}")
+    print(f"masks_test: {masks_test.shape}")
+    print("\nClass distribution:")
+    print("Training set:", np.bincount(y_train))
+    print("Test set:", np.bincount(y_test))
+
+    model = create_masked_tabnet(input_dim=X_train.shape[1])
+
+    history = train_masked_tabnet(
+        model,
+        X_train,
+        masks_train,
+        y_train,
+        X_test,
+        masks_test,
+        y_test,
+        epochs=100,
+        batch_size=64,
+    )
+
+    plot_training_history(history)
+
+    # Create and build a fresh model
+    best_model = create_masked_tabnet(input_dim=X_train.shape[1])
+
+    # Build the model by calling it once with dummy data
+    dummy_features = np.zeros((1, X_train.shape[1]), dtype=np.float32)
+    dummy_masks = np.ones((1, X_train.shape[1]), dtype=np.float32)
+    _ = best_model([dummy_features, dummy_masks])
+
+    # Now load the weights
+    best_model.load_weights("masked_tabnet.weights.h5")
+
+    y_pred = (best_model.predict([X_test, masks_test]) > 0.5).astype(int)
+
+    print("\nFinal Classification Report:")
+    print(classification_report(y_test, y_pred))
+
+    cm = confusion_matrix(y_test, y_pred)
+    plt.figure(figsize=(8, 6))
+    sns.heatmap(cm, annot=True, fmt="d", cmap="Blues")
+    plt.title("Confusion Matrix")
+    plt.ylabel("True Label")
+    plt.xlabel("Predicted Label")
+    plt.show()

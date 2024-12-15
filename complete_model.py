@@ -171,9 +171,6 @@ class MissingValueNetwork:
             metrics=[
                 "accuracy",
                 tf.keras.metrics.AUC(name="auc"),
-                tf.keras.metrics.Precision(name="precision"),
-                tf.keras.metrics.Recall(name="recall"),
-                tf.keras.metrics.F1Score(name="f1", threshold=0.5),
             ],
         )
 
