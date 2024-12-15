@@ -405,3 +405,12 @@ if __name__ == "__main__":
     plt.ylabel("True Label")
     plt.xlabel("Predicted Label")
     plt.show()
+
+# Save the preprocessor
+import pickle
+
+with open("alzheimer_preprocessor.pkl", "wb") as f:
+    pickle.dump(preprocessor, f)
+
+# Save the model
+best_model.save("alzheimer_model.keras")
